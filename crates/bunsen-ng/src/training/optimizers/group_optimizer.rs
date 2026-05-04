@@ -1,5 +1,8 @@
 #![allow(unused_imports)]
-use std::marker::PhantomData;
+use std::{
+    marker::PhantomData,
+    sync::Arc,
+};
 
 use burn::{
     Tensor,
@@ -20,6 +23,7 @@ use burn::{
         record::AdaptorRecord,
     },
     prelude::Backend,
+    record::Record,
     tensor::backend::AutodiffBackend,
 };
 use hashbrown::{
@@ -28,8 +32,10 @@ use hashbrown::{
 };
 
 use crate::training::optimizers::{
+    FixedLrSelector,
     clone_simple_optimizer,
     compat::GradAdaptor,
+    lr_selectors::LrSelector,
 };
 
 /// A group of [`ParamId`] assigned to a single optimizer instance.
@@ -44,6 +50,9 @@ where
 
     /// The optimizer instance assigned to this group.
     pub optim: O,
+
+    /// Learning rate mapping function.
+    pub lr_selector: Option<Arc<dyn LrSelector>>,
 
     phantom: PhantomData<B>,
 }
@@ -61,6 +70,7 @@ where
         Self {
             params,
             optim,
+            lr_selector: None,
             phantom: PhantomData,
         }
     }
@@ -78,6 +88,89 @@ where
             params.into_iter().collect(),
             clone_simple_optimizer(adaptor),
         )
+    }
+
+    /// Get the learning rate for this group.
+    pub fn lr(
+        &self,
+        global: LearningRate,
+        named_lrs: &HashMap<String, LearningRate>,
+    ) -> LearningRate {
+        self.lr_selector
+            .as_ref()
+            .map(|lr_fn| lr_fn.select(global, named_lrs))
+            .unwrap_or(global)
+    }
+
+    /// Get the learning rate mapping function.
+    pub fn lr_selector(&self) -> Option<Arc<dyn LrSelector>> {
+        self.lr_selector.clone()
+    }
+
+    /// Set the learning rate mapping function.
+    pub fn with_lr_selector<F>(
+        mut self,
+        selector: F,
+    ) -> Self
+    where
+        F: LrSelector + 'static,
+    {
+        self.lr_selector = Some(Arc::new(selector));
+        self
+    }
+
+    /// Set a fixed learning rate for this group.
+    pub fn with_fixed_lr(
+        self,
+        lr: LearningRate,
+    ) -> Self {
+        self.with_lr_selector(FixedLrSelector::new(lr))
+    }
+}
+
+/// The state of an [`OptimizerGroup`].
+#[derive(Clone)]
+pub struct OptimizerGroupRecord<O, B>
+where
+    B: AutodiffBackend,
+    O: SimpleOptimizer<B::InnerBackend>,
+{
+    /// The optimizer states for each parameter in the group.
+    pub param_map: HashMap<ParamId, AdaptorRecord<O, B>>,
+}
+
+impl<O, B> Record<B> for OptimizerGroupRecord<O, B>
+where
+    B: AutodiffBackend,
+    O: SimpleOptimizer<B::InnerBackend>,
+{
+    type Item<S2: burn::record::PrecisionSettings> =
+        (Vec<(String, <AdaptorRecord<O, B> as Record<B>>::Item<S2>)>,);
+
+    fn into_item<S2: burn::record::PrecisionSettings>(self) -> Self::Item<S2> {
+        (self
+            .param_map
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.into_item::<S2>()))
+            .collect(),)
+    }
+
+    fn from_item<S2: burn::record::PrecisionSettings>(
+        item: Self::Item<S2>,
+        device: &<B as Backend>::Device,
+    ) -> Self {
+        Self {
+            param_map: item
+                .0
+                .into_iter()
+                .map(|(k, v)| {
+                    (
+                        ParamId::from(k.parse::<u64>().unwrap_or(0)),
+                        AdaptorRecord::from_item::<S2>(v, device),
+                    )
+                })
+                .collect(),
+        }
     }
 }
 
@@ -195,7 +288,14 @@ macro_rules! define_group_optimizer_adaptor {
                     )+
 
                     let records = (
-                        $( vec![HashMap::new(); [<groups_ $idx>].len()], )+
+                        $(
+                            vec![
+                                OptimizerGroupRecord {
+                                    param_map: HashMap::new()
+                                };
+                                [<groups_ $idx>].len()
+                            ],
+                        )+
                     );
 
                     Ok(Self {
@@ -222,12 +322,15 @@ macro_rules! define_group_optimizer_adaptor {
                     module: M,
                     mut grads: GradAdaptor,
                 ) -> M {
+                    let named_lrs: HashMap<String, LearningRate> = Default::default();
+
                     module.map(&mut [<GroupOptimizerMapper $N>] {
                         $( [<groups_ $idx>]: &self.[<groups_ $idx>], )+
                         dispatch: &self.dispatch,
                         $( [<records_ $idx>]: &mut self.records.$idx, )+
                         grads: &mut grads,
-                        lr,
+                        global_lr: lr,
+                        named_lrs: &named_lrs,
                         grad_clipping: self.grad_clipping.as_ref(),
                     })
                 }
@@ -242,7 +345,7 @@ macro_rules! define_group_optimizer_adaptor {
             {
                 #[allow(clippy::type_complexity)]
                 type Record = (
-                    $( Vec<HashMap<ParamId, AdaptorRecord<$O, B>>>, )+
+                    $( Vec<OptimizerGroupRecord<$O, B>>, )+
                 );
 
                 fn step(
@@ -286,10 +389,13 @@ macro_rules! define_group_optimizer_adaptor {
 
                 dispatch: &'a HashMap<ParamId, (usize, usize)>,
 
-                $( [<records_ $idx>]: &'a mut Vec<HashMap<ParamId, AdaptorRecord<$O, B>>>, )+
+                $( [<records_ $idx>]: &'a mut Vec<OptimizerGroupRecord<$O, B>>, )+
 
                 grads: &'a mut GradAdaptor,
-                lr: LearningRate,
+
+                global_lr: LearningRate,
+                named_lrs: &'a HashMap<String, LearningRate>,
+
                 grad_clipping: Option<&'a GradientClipping>,
             }
 
@@ -331,15 +437,20 @@ macro_rules! define_group_optimizer_adaptor {
 
                     let tensor = match type_tag {
                         $(
-                            $idx => step_group::<B, $O, D>(
-                                &self.[<groups_ $idx>][idx].optim,
-                                &mut self.[<records_ $idx>][idx],
-                                id,
-                                tensor.inner(),
-                                grad,
-                                &device,
-                                self.lr,
-                            ),
+                            $idx => {
+                                let group = &self.[<groups_ $idx>][idx];
+                                let lr = group.lr(self.global_lr, self.named_lrs);
+
+                                step_group::<B, $O, D>(
+                                    &group.optim,
+                                    &mut self.[<records_ $idx>][idx].param_map,
+                                    id,
+                                    tensor.inner(),
+                                    grad,
+                                    &device,
+                                    lr,
+                                )
+                            },
                         )+
                         _ => unreachable!(
                             concat!(
