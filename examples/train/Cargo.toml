@@ -11,6 +11,7 @@ zsl-chat-data = { path = "../../crates/zsl-chat-data", version = "0.0.9" }
 bunsen = { workspace = true }
 bunsen-ng = { path = "../../crates/bunsen-ng", version = "0.0.9" }
 
+num-traits = { workspace = true }
 rand = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
