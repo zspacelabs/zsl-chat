@@ -36,6 +36,7 @@ regex = "1.12.3"
 xot = "0.31.2"
 xee-xpath = "0.1.5"
 
+num-traits = "0.2.19"
 indextree = "4.8.1"
 debug-ignore = "1.0.5"
 indoc = "2.0.7"

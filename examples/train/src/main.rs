@@ -7,7 +7,6 @@ use std::{
     },
 };
 
-use anyhow::bail;
 use bunsen_ng::{
     modules::reflection::XmlModuleTree,
     training::optimizers::{
@@ -16,16 +15,7 @@ use bunsen_ng::{
     },
 };
 use burn::{
-    data::dataloader::DataLoader,
-    grad_clipping::GradientClipping,
-    lr_scheduler::{
-        composed::{
-            ComposedLrSchedulerConfig,
-            SchedulerReduction,
-        },
-        cosine::CosineAnnealingLrSchedulerConfig,
-        linear::LinearLrSchedulerConfig,
-    },
+    lr_scheduler::linear::LinearLrSchedulerConfig,
     module::{
         Module,
         ParamId,
@@ -34,6 +24,7 @@ use burn::{
     optim::{
         AdamWConfig,
         MuonConfig,
+        decay::WeightDecayConfig,
     },
     prelude::Backend,
     record::CompactRecorder,
@@ -60,6 +51,7 @@ use burn::{
 };
 use clap::Parser;
 use hashbrown::HashSet;
+use num_traits::Pow;
 use rand::{
     SeedableRng,
     rngs::StdRng,
@@ -73,6 +65,7 @@ use wordchipper_cli_util::logging::LogArgs;
 use zsl_chat::gpt::gpt_model::{
     GPT,
     GPTConfig,
+    GPTMeta,
 };
 use zsl_chat_data::{
     dataloader::ChatDataLoader,
@@ -116,7 +109,11 @@ pub struct Args {
 
     /// The embedding dimension size.
     #[clap(long, default_value = "768")]
-    pub embedding_dim: usize,
+    pub n_embed: usize,
+
+    /// The number of layers.
+    #[clap(long, default_value = "8")]
+    pub n_layer: usize,
 
     /// The pretrained vocabulary.
     #[clap(long, default_value = "openai:p50k_edit")]
@@ -134,21 +131,24 @@ pub struct Args {
     #[arg(long)]
     pub dataset_dir: String,
 
-    /// Learning rate
-    #[arg(long, default_value_t = 5e-5)]
-    pub learning_rate: f64,
+    #[arg(long, default_value_t = 0.008)]
+    pub unembedding_lr: f64,
 
-    /*
-    /// Warm-up epochs.
-    #[arg(long, default_value_t = 5)]
-    pub warmup_epochs: usize,
-     */
-    /// Enable cautious weight decay.
-    #[arg(long, default_value = "false")]
-    pub cautious_weight_decay: bool,
+    #[arg(long, default_value_t = 0.3)]
+    pub embedding_lr: f64,
+
+    #[arg(long, default_value_t = 0.02)]
+    pub matrix_lr: f64,
+
+    #[arg(long, default_value_t = 0.5)]
+    pub scalar_lr: f64,
+
+    /// Warm-up steps.
+    #[arg(long, default_value_t = 300)]
+    pub warmup_steps: usize,
 
     /// Optimizer Weight decay.
-    #[arg(long, default_value_t = 5e-2)]
+    #[arg(long, default_value_t = 0.28)]
     pub weight_decay: f32,
 
     /// Number of epochs to train the model.
@@ -258,10 +258,11 @@ fn run<B: AutodiffBackend>(args: &Args) -> anyhow::Result<()> {
         .build(vocab);
 
     let gpt_config = GPTConfig::new()
-        //.with_n_layer(8)
+        .with_n_embed(args.n_embed)
+        .with_n_layer(args.n_layer)
         .with_vocab_size(vocab_size);
 
-    let gpt: GPT<B> = gpt_config.init::<B>(&device);
+    let gpt: GPT<B> = gpt_config.clone().init::<B>(&device);
 
     let host = GptHost { gpt };
 
@@ -283,19 +284,6 @@ fn run<B: AutodiffBackend>(args: &Args) -> anyhow::Result<()> {
     let validation_data_loader: ChatDataLoader<B::InnerBackend> =
         ChatDataLoader::new(validation_paths, None, &device, tok.clone(), dl_config);
 
-    // TODO: This is ... a hack.
-    let iters_per_epoch = training_data_loader.num_items() * 500;
-
-    let lr_scheduler = ComposedLrSchedulerConfig::new()
-        .linear(LinearLrSchedulerConfig::new(1e-10, 1.0, 300))
-        .cosine(CosineAnnealingLrSchedulerConfig::new(
-            args.learning_rate,
-            iters_per_epoch * args.num_epochs,
-        ))
-        .with_reduction(SchedulerReduction::Prod)
-        .init()
-        .expect("Failed to initialize learning rate scheduler");
-
     let training = SupervisedTraining::new(
         artifact_dir,
         Arc::new(training_data_loader),
@@ -309,72 +297,112 @@ fn run<B: AutodiffBackend>(args: &Args) -> anyhow::Result<()> {
 
     let mut mtree = XmlModuleTree::build(&host);
 
-    let all_params: HashSet<ParamId> = mtree.param_ids()?.into_iter().collect();
-    // ==>
-    //   let all_params: HashSet<ParamId> = mtree
-    //       .query()
-    //       .params()
-    //       .to_param_ids()?
-    //       .collect();
-    //
-    // ==>
-    //   let muon_params: HashSet<ParamId> = mtree
-    //       .query()
-    //       .select("descendant-or-self::Param")
-    //       .to_param_ids()?
-    //       .collect();
-
-    let muon_params: HashSet<ParamId> = mtree
-        .select_params("GptHost/GPT/Vec[@name='h']")
-        .filter("@rank=2")
+    // See: GPT.setup_optimizer
+    // <https://github.com/karpathy/nanochat/blob/master/nanochat/gpt.py#L374>
+    let matrix_params: HashSet<ParamId> = mtree
+        .select_params("GptHost/GPT/*[@name='h']/Linear/*[@name='weight',@rank=2]")
         .to_param_ids()?
         .into_iter()
         .collect();
-    // ==>
-    //   let muon_params: HashSet<ParamId> = mtree
-    //       .query()
-    //       .select("GptHost/GPT/Vec[@name='h']")
-    //       .params()
-    //       .filter("@rank=2")
-    //       .to_param_ids()?
-    //       .collect();
-    //
-    // ==>
-    //   let muon_params: HashSet<ParamId> = mtree
-    //       .query()
-    //       .select("GptHost/GPT/Vec[@name='h']/descendant-or-self::Param[@rank=2]"
-    // )       .to_param_ids()?
-    //       .collect();
 
-    let adamw_params: HashSet<ParamId> = all_params
-        .difference(&muon_params)
+    // TODO: value_embeds
+    // TODO: resid
+    // TODO: x0
+    // TODO: smear, smear_gate, blackout
+
+    let embedding_params: HashSet<ParamId> = mtree
+        .select_params("GptHost/GPT/*[@name='wte']")
+        .to_param_ids()?
+        .into_iter()
+        .collect();
+
+    let lm_head_params: HashSet<ParamId> = mtree
+        .select_params("GptHost/GPT/*[@name='lm_head']")
+        .to_param_ids()?
+        .into_iter()
+        .collect();
+
+    let remnant_params: HashSet<ParamId> = mtree
+        .param_ids()?
+        .into_iter()
+        .collect::<HashSet<ParamId>>()
+        .difference(&matrix_params)
         .cloned()
-        .collect::<HashSet<_>>();
+        .collect::<HashSet<ParamId>>()
+        .difference(&embedding_params)
+        .cloned()
+        .collect::<HashSet<ParamId>>()
+        .difference(&lm_head_params)
+        .cloned()
+        .collect::<HashSet<ParamId>>();
 
-    if muon_params.is_empty() {
-        bail!("Muon parameters not found");
-    }
-    if adamw_params.is_empty() {
-        bail!("AdamW parameters not found");
-    }
+    let model_dim = gpt_config.n_embed();
+    let dmodel_lr_scale: f64 = (model_dim as f64 / 768.0_f64).pow(-0.5);
+
+    let lm_head_lr = args.unembedding_lr * dmodel_lr_scale;
+    let embedding_lr = args.embedding_lr * dmodel_lr_scale;
+    let scalar_lr = args.scalar_lr;
+    let matrix_lr = args.matrix_lr;
+
+    // This is only used to scale the learning rates for each group below.
+    // This implements warmup scheduling for learning rate.
+    let warmup_scheduler = LinearLrSchedulerConfig::new(1e-10, 1.0, args.warmup_steps)
+        .init()
+        .expect("Failed to initialize learning rate scheduler");
+
+    // TODO: per-group GradientClipping.
 
     let optimizer = GroupOptimizerAdaptor2::new(
-        vec![OptimizerGroup::from_adaptor(
-            adamw_params,
-            &AdamWConfig::new()
-                .with_cautious_weight_decay(args.cautious_weight_decay)
-                .with_weight_decay(args.weight_decay)
-                .init::<B, GptHost<B>>(),
-        )],
         vec![
-            OptimizerGroup::from_adaptor(muon_params, &MuonConfig::new().init::<B, GptHost<B>>())
-                .with_fixed_lr(args.learning_rate * 0.5),
+            OptimizerGroup::from_adaptor(
+                lm_head_params,
+                &AdamWConfig::new()
+                    .with_beta_1(0.8)
+                    .with_beta_2(0.96)
+                    .with_epsilon(1e-10)
+                    .with_weight_decay(0.01)
+                    .init::<B, GptHost<B>>(),
+            )
+            .with_lr_selector(move |lr: f64, _: &hashbrown::HashMap<String, f64>| lr * lm_head_lr),
+            OptimizerGroup::from_adaptor(
+                embedding_params,
+                &AdamWConfig::new()
+                    .with_beta_1(0.8)
+                    .with_beta_2(0.995)
+                    .with_epsilon(1e-10)
+                    .with_weight_decay(0.001)
+                    .init::<B, GptHost<B>>(),
+            )
+            .with_lr_selector(move |lr: f64, _: &hashbrown::HashMap<String, f64>| {
+                lr * embedding_lr
+            }),
+            OptimizerGroup::from_adaptor(
+                remnant_params,
+                &AdamWConfig::new()
+                    .with_beta_1(0.8)
+                    .with_beta_2(0.96)
+                    .with_epsilon(1e-10)
+                    .with_weight_decay(0.01)
+                    .init::<B, GptHost<B>>(),
+            )
+            .with_lr_selector(move |lr: f64, _: &hashbrown::HashMap<String, f64>| lr * scalar_lr),
+        ],
+        vec![
+            OptimizerGroup::from_adaptor(
+                matrix_params,
+                &MuonConfig::new()
+                    // .with_adjust_lr_fn(AdjustLrFn::MatchRmsAdamW)
+                    .with_weight_decay(Some(WeightDecayConfig {
+                        penalty: args.weight_decay,
+                    }))
+                    .init::<B, GptHost<B>>(),
+            )
+            .with_lr_selector(move |lr: f64, _: &hashbrown::HashMap<String, f64>| lr * matrix_lr),
         ],
     )
-    .unwrap()
-    .with_grad_clipping(GradientClipping::Value(2.0));
+    .unwrap();
 
-    let result = training.launch(Learner::new(host, optimizer, lr_scheduler));
+    let result = training.launch(Learner::new(host, optimizer, warmup_scheduler));
 
     result
         .model

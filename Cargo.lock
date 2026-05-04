@@ -7883,6 +7883,7 @@ dependencies = [
  "clap",
  "hashbrown 0.16.1",
  "log",
+ "num-traits",
  "rand 0.10.0",
  "regex",
  "wordchipper",
