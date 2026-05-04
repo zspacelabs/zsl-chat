@@ -366,10 +366,10 @@ fn run<B: AutodiffBackend>(args: &Args) -> anyhow::Result<()> {
                 .with_weight_decay(args.weight_decay)
                 .init::<B, GptHost<B>>(),
         )],
-        vec![OptimizerGroup::from_adaptor(
-            muon_params,
-            &MuonConfig::new().init::<B, GptHost<B>>(),
-        )],
+        vec![
+            OptimizerGroup::from_adaptor(muon_params, &MuonConfig::new().init::<B, GptHost<B>>())
+                .with_fixed_lr(args.learning_rate * 0.5),
+        ],
     )
     .unwrap()
     .with_grad_clipping(GradientClipping::Value(2.0));
