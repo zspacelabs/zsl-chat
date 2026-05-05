@@ -341,7 +341,7 @@ fn run<B: AutodiffBackend>(args: &Args) -> anyhow::Result<()> {
 
     let lm_head_lr = args.unembedding_lr * dmodel_lr_scale;
     let embedding_lr = args.embedding_lr * dmodel_lr_scale;
-    let scalar_lr = args.scalar_lr;
+    // let scalar_lr = args.scalar_lr;
     let matrix_lr = args.matrix_lr;
 
     // This is only used to scale the learning rates for each group below.
@@ -385,7 +385,7 @@ fn run<B: AutodiffBackend>(args: &Args) -> anyhow::Result<()> {
                     .with_weight_decay(0.01)
                     .init::<B, GptHost<B>>(),
             )
-            .with_lr_selector(move |lr: f64, _: &hashbrown::HashMap<String, f64>| lr * scalar_lr),
+            .with_lr_selector(move |lr: f64, _: &hashbrown::HashMap<String, f64>| lr * matrix_lr),
         ],
         vec![
             OptimizerGroup::from_adaptor(
